@@ -53,6 +53,9 @@ public class EpicService {
     @Autowired
     private RiskAttachmentRepository riskAttachmentRepository;
 
+    @Autowired
+    private ProjectMilestoneRepository projectMilestoneRepository;
+
     // ✅ Create Epic
     public EpicDto createEpic(EpicDto epicDto, Long userId) {
 
@@ -175,6 +178,9 @@ public class EpicService {
             // 3. Delete associated risks
             riskRepository.deleteAll(risksToDelete);
         }
+
+        // Milestones may optionally reference an epic; unlink them so the FK does not block deletion.
+        projectMilestoneRepository.clearEpic(id);
 
         epicRepository.delete(epic);
 

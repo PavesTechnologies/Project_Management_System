@@ -231,6 +231,7 @@ public class AuditAspect {
             case "Sprint" -> "sprints";
             case "Comment" -> "comment";
             case "Status" -> "statuses";
+            case "Milestone" -> "project_milestones";
             default -> entity.toLowerCase();
         };
     }
