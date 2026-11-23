@@ -26,4 +26,12 @@ public interface ProjectMilestoneService {
     MilestoneResponse completeMilestone(Long milestoneId, MilestoneCompleteRequest request, UserDto currentUser);
 
     void deleteMilestone(Long milestoneId, UserDto currentUser);
+
+    /**
+     * Moves every PLANNED milestone whose planned start date is on or before {@code asOf}
+     * to IN_PROGRESS. Runs without a user: invoked by the auto-start scheduler.
+     *
+     * @return how many milestones were started
+     */
+    int startDueMilestones(java.time.LocalDate asOf);
 }
