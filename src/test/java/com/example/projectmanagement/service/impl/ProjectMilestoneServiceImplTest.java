@@ -423,4 +423,239 @@ class ProjectMilestoneServiceImplTest {
                 .isEqualByComparingTo("1.25");
         assertThat(ProjectMilestoneServiceImpl.estimateAmount(null, new BigDecimal("10"))).isNull();
     }
+
+    /* ---------------- date overlap ---------------- */
+
+    /** Gives a stored milestone a planned range and keeps sequenceOrder aligned with creation order. */
+    private ProjectMilestone dated(ProjectMilestone m, String start, String due) {
+        m.setPlannedStartDate(LocalDate.parse(start));
+        m.setPlannedDueDate(LocalDate.parse(due));
+        return m;
+    }
+
+    private MilestoneCreateRequest datedCreateRequest(String pct, String start, String due) {
+        MilestoneCreateRequest r = createRequest(pct, true);
+        r.setPlannedStartDate(LocalDate.parse(start));
+        r.setPlannedDueDate(LocalDate.parse(due));
+        return r;
+    }
+
+    @Test
+    void overlappingDatesAreRejectedWhenTheEarlierMilestoneIsStillOpen() {
+        dated(existing("15", true, MilestoneExecutionStatus.PLANNED), "2026-01-01", "2026-03-31");
+
+        assertThatThrownBy(() -> service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-02-01", "2026-04-30"), pm))
+                .isInstanceOf(ValidationException.class)
+                .satisfies(t -> assertThat(errorsOf(t)).hasSize(1)
+                        .first().asString().contains("overlap").contains("PAY-M001"));
+        assertThat(stored).hasSize(1);
+    }
+
+    @Test
+    void inProgressAndOnHoldMilestonesAlsoBlockOverlap() {
+        for (MilestoneExecutionStatus blocking : List.of(MilestoneExecutionStatus.IN_PROGRESS,
+                MilestoneExecutionStatus.ON_HOLD)) {
+            stored.clear();
+            dated(existing("15", true, blocking), "2026-01-01", "2026-03-31");
+
+            assertThatThrownBy(() -> service.createMilestone(PROJECT_ID,
+                    datedCreateRequest("15", "2026-02-01", "2026-04-30"), pm))
+                    .as("status %s must block an overlapping range", blocking)
+                    .isInstanceOf(ValidationException.class);
+        }
+    }
+
+    @Test
+    void completedOrCancelledMilestonesReleaseTheirDateRange() {
+        for (MilestoneExecutionStatus terminal : List.of(MilestoneExecutionStatus.COMPLETED,
+                MilestoneExecutionStatus.CANCELLED)) {
+            stored.clear();
+            dated(existing("15", true, terminal), "2026-01-01", "2026-03-31");
+
+            MilestoneResponse created = service.createMilestone(PROJECT_ID,
+                    datedCreateRequest("15", "2026-02-01", "2026-04-30"), pm);
+
+            assertThat(created.getPlannedStartDate())
+                    .as("status %s must not block", terminal)
+                    .isEqualTo(LocalDate.parse("2026-02-01"));
+        }
+    }
+
+    @Test
+    void rangesTouchingOnASingleDayCountAsOverlapping() {
+        dated(existing("15", true, MilestoneExecutionStatus.PLANNED), "2026-01-01", "2026-03-31");
+
+        // Starts on the earlier milestone's due date: inclusive ranges, so this is an overlap.
+        assertThatThrownBy(() -> service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-03-31", "2026-04-30"), pm))
+                .isInstanceOf(ValidationException.class);
+
+        // One day later is clear.
+        assertThat(service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-04-01", "2026-04-30"), pm).getId()).isNotNull();
+    }
+
+    @Test
+    void milestonesWithoutBothDatesNeitherBlockNorAreBlocked() {
+        existing("15", true, MilestoneExecutionStatus.PLANNED); // no dates at all
+
+        assertThat(service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-02-01", "2026-04-30"), pm).getId()).isNotNull();
+    }
+
+    @Test
+    void updateCanKeepItsOwnDatesWithoutSelfOverlap() {
+        ProjectMilestone m = dated(existing("15", true, MilestoneExecutionStatus.PLANNED),
+                "2026-01-01", "2026-03-31");
+        MilestoneUpdateRequest request = updateRequestFrom(m);
+        request.setPlannedStartDate(m.getPlannedStartDate());
+        request.setPlannedDueDate(m.getPlannedDueDate());
+        request.setName("Renamed");
+
+        assertThat(service.updateMilestone(m.getId(), request, pm).getName()).isEqualTo("Renamed");
+    }
+
+    /* ---------------- cascading estimate (option B) ---------------- */
+
+    @Test
+    void eachMilestoneBillsItsPercentageOfTheRemainingBudget() {
+        project.setProjectBudget(new BigDecimal("40000.00"));
+        when(milestoneRepository.findMaxSequenceOrder(PROJECT_ID)).thenAnswer(inv -> stored.size());
+
+        MilestoneResponse first = service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-01-01", "2026-01-31"), pm);
+        MilestoneResponse second = service.createMilestone(PROJECT_ID,
+                datedCreateRequest("15", "2026-02-01", "2026-02-28"), pm);
+
+        assertThat(first.getBaseAmount()).isEqualByComparingTo("40000.00");
+        assertThat(first.getEstimatedAmount()).isEqualByComparingTo("6000.00");
+        // 40000 - 6000 = 34000; 15% of that is 5100, not another 6000.
+        assertThat(second.getBaseAmount()).isEqualByComparingTo("34000.00");
+        assertThat(second.getEstimatedAmount()).isEqualByComparingTo("5100.00");
+    }
+
+    @Test
+    void nonBillableAndCancelledMilestonesConsumeNothingFromTheRemainder() {
+        project.setProjectBudget(new BigDecimal("40000.00"));
+        ProjectMilestone cancelled = existing("50", true, MilestoneExecutionStatus.CANCELLED);
+        ProjectMilestone free = existing("0", false, MilestoneExecutionStatus.PLANNED);
+        ProjectMilestone billable = existing("15", true, MilestoneExecutionStatus.PLANNED);
+
+        Map<Long, ProjectMilestoneServiceImpl.MilestoneEstimate> estimates =
+                ProjectMilestoneServiceImpl.estimateAmounts(project.getProjectBudget(), stored);
+
+        assertThat(estimates).doesNotContainKeys(cancelled.getId(), free.getId());
+        assertThat(estimates.get(billable.getId()).baseAmount()).isEqualByComparingTo("40000.00");
+        assertThat(estimates.get(billable.getId()).estimatedAmount()).isEqualByComparingTo("6000.00");
+    }
+
+    @Test
+    void summaryReportsTheUnbilledRemainder() {
+        project.setProjectBudget(new BigDecimal("40000.00"));
+        existing("15", true, MilestoneExecutionStatus.PLANNED);
+        existing("15", true, MilestoneExecutionStatus.PLANNED);
+
+        MilestoneSummaryResponse summary = service.getSummary(PROJECT_ID, pm);
+
+        assertThat(summary.getAllocatedAmount()).isEqualByComparingTo("11100.00"); // 6000 + 5100
+        assertThat(summary.getRemainingAmount()).isEqualByComparingTo("28900.00");
+        assertThat(summary.getAllocatedPercentage()).isEqualByComparingTo("30.00");
+    }
+
+    /* ---------------- auto-start scheduler ---------------- */
+
+    /** Mirrors the repository query: PLANNED only, planned start on or before the cutoff. */
+    private void stubDueToStart() {
+        when(milestoneRepository.findPlannedDueToStart(any())).thenAnswer(inv -> {
+            LocalDate asOf = inv.getArgument(0);
+            return stored.stream()
+                    .filter(m -> m.getExecutionStatus() == MilestoneExecutionStatus.PLANNED)
+                    .filter(m -> m.getPlannedStartDate() != null && !m.getPlannedStartDate().isAfter(asOf))
+                    .toList();
+        });
+    }
+
+    @Test
+    void plannedMilestonesStartOnTheirPlannedStartDate() {
+        ProjectMilestone today = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-03-01", "2026-03-31");
+        ProjectMilestone overdue = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-02-01", "2026-02-28");
+        ProjectMilestone future = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-04-01", "2026-04-30");
+        stubDueToStart();
+
+        assertThat(service.startDueMilestones(LocalDate.parse("2026-03-01"))).isEqualTo(2);
+
+        assertThat(today.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.IN_PROGRESS);
+        assertThat(overdue.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.IN_PROGRESS);
+        assertThat(future.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.PLANNED);
+    }
+
+    @Test
+    void autoStartClearsUpdatedBySoTheChangeReadsAsSystemDriven() {
+        ProjectMilestone due = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-01-01", "2026-03-31");
+        due.setUpdatedBy(PM_ID);
+        ProjectMilestone untouched = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-09-01", "2026-09-30");
+        untouched.setUpdatedBy(PM_ID);
+        stubDueToStart();
+
+        service.startDueMilestones(LocalDate.parse("2026-06-01"));
+
+        assertThat(due.getUpdatedBy()).isNull();
+        // A milestone the job did not start keeps its last human editor.
+        assertThat(untouched.getUpdatedBy()).isEqualTo(PM_ID);
+    }
+
+    @Test
+    void autoStartLeavesOnHoldAndTerminalMilestonesAlone() {
+        ProjectMilestone onHold = dated(existing("10", true, MilestoneExecutionStatus.ON_HOLD),
+                "2026-01-01", "2026-03-31");
+        ProjectMilestone cancelled = dated(existing("10", true, MilestoneExecutionStatus.CANCELLED),
+                "2026-01-01", "2026-03-31");
+        ProjectMilestone completed = dated(existing("10", true, MilestoneExecutionStatus.COMPLETED),
+                "2026-01-01", "2026-03-31");
+        stubDueToStart();
+
+        assertThat(service.startDueMilestones(LocalDate.parse("2026-06-01"))).isZero();
+
+        assertThat(onHold.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.ON_HOLD);
+        assertThat(cancelled.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.CANCELLED);
+        assertThat(completed.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.COMPLETED);
+    }
+
+    @Test
+    void autoStartIsIdempotentAndSkipsMilestonesWithoutAStartDate() {
+        ProjectMilestone undated = existing("10", true, MilestoneExecutionStatus.PLANNED);
+        ProjectMilestone due = dated(existing("10", true, MilestoneExecutionStatus.PLANNED),
+                "2026-01-01", "2026-03-31");
+        stubDueToStart();
+
+        assertThat(service.startDueMilestones(LocalDate.parse("2026-06-01"))).isEqualTo(1);
+        // Second run finds nothing left to do.
+        assertThat(service.startDueMilestones(LocalDate.parse("2026-06-01"))).isZero();
+
+        assertThat(due.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.IN_PROGRESS);
+        assertThat(undated.getExecutionStatus()).isEqualTo(MilestoneExecutionStatus.PLANNED);
+    }
+
+    @Test
+    void autoStartDoesNotTouchTheDatabaseWhenNothingIsDue() {
+        stubDueToStart();
+
+        assertThat(service.startDueMilestones(LocalDate.parse("2026-06-01"))).isZero();
+        verify(milestoneRepository, never()).flush();
+    }
+
+    @Test
+    void totalAllocationStillCannotExceed100Percent() {
+        existing("60", true, MilestoneExecutionStatus.PLANNED);
+
+        assertThatThrownBy(() -> service.createMilestone(PROJECT_ID, createRequest("50", true), pm))
+                .isInstanceOf(ValidationException.class)
+                .satisfies(t -> assertThat(errorsOf(t)).first().asString().contains("cannot exceed 100%"));
+    }
 }

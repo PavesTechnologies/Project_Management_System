@@ -12,6 +12,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
@@ -36,6 +37,16 @@ public interface ProjectMilestoneRepository extends JpaRepository<ProjectMilesto
 
     @Query("SELECT m FROM ProjectMilestone m LEFT JOIN FETCH m.epic JOIN FETCH m.project WHERE m.id = :id")
     Optional<ProjectMilestone> findWithDetailsById(@Param("id") Long id);
+
+    /**
+     * PLANNED milestones whose planned start date has arrived, for the auto-start scheduler.
+     * ON_HOLD is deliberately excluded: a pause is a human decision and must not be undone by a job.
+     */
+    @Query("SELECT m FROM ProjectMilestone m JOIN FETCH m.project " +
+            "WHERE m.executionStatus = com.example.projectmanagement.enums.MilestoneExecutionStatus.PLANNED " +
+            "AND m.plannedStartDate IS NOT NULL AND m.plannedStartDate <= :asOf " +
+            "ORDER BY m.project.id, m.sequenceOrder")
+    List<ProjectMilestone> findPlannedDueToStart(@Param("asOf") LocalDate asOf);
 
     boolean existsByProjectIdAndMilestoneCode(Long projectId, String milestoneCode);
 

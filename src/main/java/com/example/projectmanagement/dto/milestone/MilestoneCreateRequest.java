@@ -24,8 +24,10 @@ public class MilestoneCreateRequest {
 
     private Long epicId;
 
+    @NotNull(message = "Planned start date is required")
     private LocalDate plannedStartDate;
 
+    @NotNull(message = "Planned due date is required")
     private LocalDate plannedDueDate;
 
     @NotNull(message = "Billable flag is required")

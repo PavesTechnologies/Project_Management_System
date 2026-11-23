@@ -15,6 +15,7 @@ import com.example.projectmanagement.service.ProjectMilestoneService;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityNotFoundException;
 import jakarta.persistence.LockModeType;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
@@ -26,10 +27,24 @@ import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.util.*;
 
+@Slf4j
 @Service
 public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
 
     static final BigDecimal FULL_ALLOCATION = new BigDecimal("100.00");
+    static final BigDecimal HUNDRED = new BigDecimal("100");
+
+    /**
+     * Milestones in these statuses still own their planned date range, so a new or edited
+     * milestone may not overlap them. COMPLETED and CANCELLED are terminal and release the range.
+     */
+    static final Set<MilestoneExecutionStatus> DATE_BLOCKING_STATUSES = EnumSet.of(
+            MilestoneExecutionStatus.PLANNED,
+            MilestoneExecutionStatus.IN_PROGRESS,
+            MilestoneExecutionStatus.ON_HOLD);
+
+    /** Base the allocation % was applied to, and the resulting amount. */
+    public record MilestoneEstimate(BigDecimal baseAmount, BigDecimal estimatedAmount) {}
 
     private final ProjectMilestoneRepository milestoneRepository;
     private final EpicRepository epicRepository;
@@ -54,8 +69,11 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
                                                   MilestoneBillingReadiness readiness, Pageable pageable,
                                                   UserDto currentUser) {
         Project project = projectAccessService.requireProjectManagerAccess(projectId, currentUser);
+        // The cascade depends on every milestone in the project, not just the current page.
+        Map<Long, MilestoneEstimate> estimates =
+                estimateAmounts(project.getProjectBudget(), milestoneRepository.findAllByProjectId(projectId));
         return milestoneRepository.findByProjectFiltered(projectId, status, readiness, pageable)
-                .map(m -> toResponse(m, project));
+                .map(m -> toResponse(m, project, estimates));
     }
 
     @Override
@@ -69,6 +87,14 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
             byStatus.merge(m.getExecutionStatus(), 1L, Long::sum);
         }
         BigDecimal allocated = activeAllocationTotal(all);
+
+        // Money side of the cascade: what the milestones already claim, and what is still unbilled.
+        BigDecimal budget = project.getProjectBudget();
+        Map<Long, MilestoneEstimate> estimates = estimateAmounts(budget, all);
+        BigDecimal allocatedAmount = budget == null ? null : estimates.values().stream()
+                .map(MilestoneEstimate::estimatedAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal remainingAmount = budget == null ? null : budget.subtract(allocatedAmount);
 
         return MilestoneSummaryResponse.builder()
                 .projectId(projectId)
@@ -84,7 +110,9 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
                 .allocatedPercentage(allocated)
                 .remainingPercentage(FULL_ALLOCATION.subtract(allocated).max(BigDecimal.ZERO))
                 .allocationComplete(allocated.compareTo(FULL_ALLOCATION) == 0)
-                .projectBudget(project.getProjectBudget())
+                .projectBudget(budget)
+                .allocatedAmount(allocatedAmount)
+                .remainingAmount(remainingAmount)
                 .currency(project.getProjectBudgetCurrency())
                 .build();
     }
@@ -122,18 +150,21 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         milestone.setCreatedBy(currentUser.getId());
         milestone.setUpdatedBy(currentUser.getId());
 
+        List<ProjectMilestone> projectMilestones = new ArrayList<>(milestoneRepository.findAllByProjectId(projectId));
+
         validateDates(milestone, errors);
         validateMilestoneAllocation(milestone, errors);
+        validateDateOverlap(milestone, projectMilestones, errors);
         throwIfErrors(errors);
 
-        List<ProjectMilestone> projectMilestones = new ArrayList<>(milestoneRepository.findAllByProjectId(projectId));
         projectMilestones.add(milestone);
         validateProjectAllocation(projectMilestones);
 
         milestoneRepository.save(milestone);
         recomputeReadiness(projectMilestones);
         milestoneRepository.flush();
-        return toResponse(milestone, project);
+        return toResponse(milestone, project,
+                estimateAmounts(project.getProjectBudget(), projectMilestones));
     }
 
     @Override
@@ -168,15 +199,18 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         milestone.setAllocationPercentage(newPercentage);
         milestone.setUpdatedBy(currentUser.getId());
 
+        List<ProjectMilestone> projectMilestones = milestoneRepository.findAllByProjectId(project.getId());
+
         validateDates(milestone, errors);
         validateMilestoneAllocation(milestone, errors);
+        validateDateOverlap(milestone, projectMilestones, errors);
         throwIfErrors(errors);
 
-        List<ProjectMilestone> projectMilestones = milestoneRepository.findAllByProjectId(project.getId());
         validateProjectAllocation(projectMilestones);
         recomputeReadiness(projectMilestones);
         milestoneRepository.flush();
-        return toResponse(milestone, project);
+        return toResponse(milestone, project,
+                estimateAmounts(project.getProjectBudget(), projectMilestones));
     }
 
     @Override
@@ -202,7 +236,8 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         List<ProjectMilestone> projectMilestones = milestoneRepository.findAllByProjectId(project.getId());
         recomputeReadiness(projectMilestones);
         milestoneRepository.flush();
-        return toResponse(milestone, project);
+        return toResponse(milestone, project,
+                estimateAmounts(project.getProjectBudget(), projectMilestones));
     }
 
     @Override
@@ -232,7 +267,8 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         List<ProjectMilestone> projectMilestones = milestoneRepository.findAllByProjectId(project.getId());
         recomputeReadiness(projectMilestones);
         milestoneRepository.flush();
-        return toResponse(milestone, project);
+        return toResponse(milestone, project,
+                estimateAmounts(project.getProjectBudget(), projectMilestones));
     }
 
     @Override
@@ -249,6 +285,34 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         milestoneRepository.flush();
 
         recomputeReadiness(milestoneRepository.findAllByProjectId(project.getId()));
+    }
+
+    @Override
+    @Transactional
+    public int startDueMilestones(LocalDate asOf) {
+        List<ProjectMilestone> due = milestoneRepository.findPlannedDueToStart(asOf);
+        if (due.isEmpty()) return 0;
+
+        int started = 0;
+        for (ProjectMilestone m : due) {
+            // Re-check the transition rather than trusting the query: PLANNED -> IN_PROGRESS only.
+            if (!m.getExecutionStatus().allowedStatusChanges().contains(MilestoneExecutionStatus.IN_PROGRESS)) {
+                continue;
+            }
+            m.setExecutionStatus(MilestoneExecutionStatus.IN_PROGRESS);
+            // No user drove this: a null updatedBy marks the change as system-driven rather than
+            // leaving the last human editor to look responsible for it.
+            m.setUpdatedBy(null);
+            started++;
+            log.info("Auto-started milestone {} (id={}, planned start {})",
+                    m.getMilestoneCode(), m.getId(), m.getPlannedStartDate());
+        }
+
+        if (started > 0) {
+            recomputeReadiness(due);
+            milestoneRepository.flush();
+        }
+        return started;
     }
 
     /* ======================= RULES ======================= */
@@ -291,6 +355,81 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
                 && m.getPlannedDueDate().isBefore(m.getPlannedStartDate())) {
             errors.add("Planned due date cannot be before the planned start date");
         }
+    }
+
+    /**
+     * A milestone may not overlap the planned range of another milestone that is still open
+     * (PLANNED / IN_PROGRESS / ON_HOLD). Once a milestone is COMPLETED or CANCELLED its range is
+     * released and a later milestone may sit inside it.
+     * <p>
+     * Ranges are inclusive on both ends. A milestone missing either date has no comparable range,
+     * so it neither blocks nor is blocked.
+     */
+    static void validateDateOverlap(ProjectMilestone candidate,
+                                    Collection<ProjectMilestone> projectMilestones,
+                                    List<String> errors) {
+        if (!DATE_BLOCKING_STATUSES.contains(candidate.getExecutionStatus())) return;
+
+        LocalDate start = candidate.getPlannedStartDate();
+        LocalDate due = candidate.getPlannedDueDate();
+        if (start == null || due == null || due.isBefore(start)) return;
+
+        for (ProjectMilestone other : projectMilestones) {
+            if (other == candidate) continue;
+            if (candidate.getId() != null && Objects.equals(candidate.getId(), other.getId())) continue;
+            if (!DATE_BLOCKING_STATUSES.contains(other.getExecutionStatus())) continue;
+
+            LocalDate otherStart = other.getPlannedStartDate();
+            LocalDate otherDue = other.getPlannedDueDate();
+            if (otherStart == null || otherDue == null) continue;
+
+            if (!start.isAfter(otherDue) && !otherStart.isAfter(due)) {
+                errors.add("Planned dates overlap milestone " + other.getMilestoneCode()
+                        + " (" + otherStart + " to " + otherDue + ", " + other.getExecutionStatus()
+                        + "); complete or cancel it before scheduling inside its dates");
+            }
+        }
+    }
+
+    /**
+     * Option B billing: every billable milestone takes its allocation % of the amount still
+     * unbilled, not of the full budget. Milestones consume the budget in {@code sequenceOrder}
+     * (creation order), so editing dates never shifts the amounts.
+     * <pre>
+     *   base(1) = projectBudget
+     *   amount(i) = base(i) * pct(i) / 100
+     *   base(i+1) = base(i) - amount(i)
+     * </pre>
+     * Example: budget 40000, two milestones at 15% -> 6000.00 then 5100.00.
+     * Cancelled and non-billable milestones consume nothing and get no estimate.
+     */
+    static Map<Long, MilestoneEstimate> estimateAmounts(BigDecimal projectBudget,
+                                                        Collection<ProjectMilestone> milestones) {
+        Map<Long, MilestoneEstimate> estimates = new HashMap<>();
+        if (projectBudget == null) return estimates;
+
+        List<ProjectMilestone> ordered = new ArrayList<>(milestones);
+        ordered.sort(Comparator.comparing(m -> m.getSequenceOrder() == null
+                ? Integer.MAX_VALUE
+                : m.getSequenceOrder()));
+
+        BigDecimal remaining = projectBudget;
+        for (ProjectMilestone m : ordered) {
+            if (!countsTowardAllocation(m)) continue;
+            BigDecimal pct = m.getAllocationPercentage();
+            if (pct == null || pct.signum() <= 0) continue;
+
+            BigDecimal amount = estimateAmount(remaining, pct);
+            estimates.put(m.getId(), new MilestoneEstimate(remaining, amount));
+            remaining = remaining.subtract(amount);
+        }
+        return estimates;
+    }
+
+    /** Amount a percentage claims from a base. The base is the unbilled remainder, not the budget. */
+    static BigDecimal estimateAmount(BigDecimal base, BigDecimal percentage) {
+        if (base == null || percentage == null) return null;
+        return base.multiply(percentage).divide(HUNDRED, 2, RoundingMode.HALF_UP);
     }
 
     /** Single source of truth for billing readiness. Reasons are empty when READY_FOR_BILLING. */
@@ -339,12 +478,6 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
             }
         }
         return changed;
-    }
-
-    static BigDecimal estimateAmount(BigDecimal projectBudget, BigDecimal percentage) {
-        if (projectBudget == null || percentage == null) return null;
-        return projectBudget.multiply(percentage)
-                .divide(new BigDecimal("100"), 2, RoundingMode.HALF_UP);
     }
 
     /* ======================= HELPERS ======================= */
@@ -412,8 +545,17 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
         }
     }
 
+    /** Convenience for single-milestone responses: re-derives the cascade from the whole project. */
     private MilestoneResponse toResponse(ProjectMilestone m, Project project) {
+        return toResponse(m, project,
+                estimateAmounts(project.getProjectBudget(),
+                        milestoneRepository.findAllByProjectId(project.getId())));
+    }
+
+    private MilestoneResponse toResponse(ProjectMilestone m, Project project,
+                                         Map<Long, MilestoneEstimate> estimates) {
         MilestoneExecutionStatus status = m.getExecutionStatus();
+        MilestoneEstimate estimate = m.getId() == null ? null : estimates.get(m.getId());
         return MilestoneResponse.builder()
                 .id(m.getId())
                 .projectId(project.getId())
@@ -428,9 +570,8 @@ public class ProjectMilestoneServiceImpl implements ProjectMilestoneService {
                 .executionStatus(status)
                 .billable(m.isBillable())
                 .allocationPercentage(m.getAllocationPercentage())
-                .estimatedAmount(m.isBillable()
-                        ? estimateAmount(project.getProjectBudget(), m.getAllocationPercentage())
-                        : null)
+                .baseAmount(estimate != null ? estimate.baseAmount() : null)
+                .estimatedAmount(estimate != null ? estimate.estimatedAmount() : null)
                 .currency(project.getProjectBudgetCurrency())
                 .billingReadiness(m.getBillingReadiness())
                 .readinessReasons(readinessReasons(m))

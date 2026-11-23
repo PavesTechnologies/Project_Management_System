@@ -108,9 +108,21 @@ class ProjectMilestoneControllerTest {
 
         mockMvc.perform(post("/api/projects/10/milestones").with(asRole("ROLE_PROJECT_MANAGER"))
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"name\":\"Go Live\",\"billable\":true,\"allocationPercentage\":30}"))
+                        .content("{\"name\":\"Go Live\",\"billable\":true,\"allocationPercentage\":30,"
+                                + "\"plannedStartDate\":\"2026-01-01\",\"plannedDueDate\":\"2026-03-31\"}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.id").value(1));
+    }
+
+    @Test
+    void createRequiresPlannedDates() throws Exception {
+        mockMvc.perform(post("/api/projects/10/milestones").with(asRole("ROLE_PROJECT_MANAGER"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Go Live\",\"billable\":true,\"allocationPercentage\":30}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors.plannedStartDate").exists())
+                .andExpect(jsonPath("$.errors.plannedDueDate").exists());
+        verifyNoInteractions(milestoneService);
     }
 
     @Test

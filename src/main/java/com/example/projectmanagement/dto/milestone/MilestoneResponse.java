@@ -27,7 +27,13 @@ public class MilestoneResponse {
     private boolean billable;
     private BigDecimal allocationPercentage;
     /**
-     * Display-only estimate (project budget x allocation %). AR computes the
+     * The amount this milestone's allocation % was applied to: the budget still unbilled by
+     * earlier milestones, not the full project budget. Null when not billable, cancelled,
+     * or the project has no budget.
+     */
+    private BigDecimal baseAmount;
+    /**
+     * Display-only estimate (baseAmount x allocation %). AR computes the
      * billed amount from its own contract value; this is never synchronised.
      */
     private BigDecimal estimatedAmount;
